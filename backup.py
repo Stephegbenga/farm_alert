@@ -5,21 +5,40 @@ import os
 import time
 import threading
 from sound import make_sound
-from face_recognition_handler import FaceRecognitionHandler
-from alert_owner import send_email_with_attachment_from_frame
-from camera_handler import CameraHandler
-from face_recognition_handler import FaceRecognitionHandler
 
-face_recognition_handler = None
+# Import your CameraHandler class (adjust path if needed)
+# Make sure camera_handler.py is in the same directory or accessible via PYTHONPATH
 try:
-    face_recognition_handler = FaceRecognitionHandler()
-    print("Face recognition system initialized successfully")
-except Exception as e:
-    print(f"Warning: Could not initialize face recognition: {e}")
+    from camera_handler import CameraHandler
+except ImportError:
+    print("ERROR: Could not import CameraHandler. Make sure camera_handler.py is accessible.")
+    # A dummy class to allow the script to run further for debugging other parts,
+    # but you'll need a real CameraHandler.
+    class CameraHandler:
+        def __init__(self, camera_type=None, ip_camera_url=None, camera_index=0):
+            print("WARNING: Using dummy CameraHandler. No real frames will be captured.")
+            self.camera_type = camera_type
+            self.frame = np.zeros((480, 640, 3), dtype=np.uint8) # Dummy frame
+            if camera_type == 'ip':
+                 print(f"Dummy IP Camera URL: {ip_camera_url}")
+            elif camera_type == 'pi':
+                 print(f"Dummy Pi Camera")
+            else:
+                 print(f"Dummy USB Camera Index: {camera_index}")
 
+
+        def get_frame(self):
+            # In a real scenario, this would return None if a frame isn't available.
+            # For testing, we return a dummy frame.
+            # time.sleep(0.1) # Simulate frame capture delay
+            return self.frame.copy() # Return a copy
+
+        def release(self):
+            print("Dummy CameraHandler released.")
 
 # === Config ===
 MODEL_PATH = "yolov8n.onnx"  # Make sure this path is correct
+ALERT_SOUND = "alert.mp3"    # Make sure this file exists and mpg123 is installed
 INPUT_SIZE = (640, 640)      # Must match the input size your ONNX model expects
 CONF_THRESH = 0.50           # Initial confidence threshold (can be adjusted)
 NMS_THRESH = 0.45            # Non-Maximum Suppression threshold
@@ -40,6 +59,7 @@ ANIMAL_CLASSES = {"bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "be
 
 # Define TARGET_CLASSES - This is crucial!
 TARGET_CLASSES = ANIMAL_CLASSES.union({"person"})
+print(f"Targeting classes: {TARGET_CLASSES}")
 
 # === Load ONNX model ===
 session = None
@@ -239,7 +259,16 @@ def postprocess(outputs, original_shape, new_unpad_shape, padding_info):
     return results
 
 
-
+def play_alert():
+    print("Attempting to play alert sound...")
+    # Ensure mpg123 is installed: sudo apt-get install mpg123
+    # Ensure ALERT_SOUND file exists
+    if os.path.exists(ALERT_SOUND):
+        # Using os.system in a non-blocking way. Redirecting output to hide mpg123 messages.
+        os.system(f"mpg123 -q {ALERT_SOUND} >/dev/null 2>&1 &")
+        print(f"Played {ALERT_SOUND} (if mpg123 is installed and sound works).")
+    else:
+        print(f"Warning: Alert sound file '{ALERT_SOUND}' not found.")
 
 # === Main program ===
 if __name__ == "__main__":
@@ -248,9 +277,15 @@ if __name__ == "__main__":
         exit()
 
     print("Starting detection with threaded camera capture...")
+    print(f"Attempting to use IP Camera URL: {os.getenv('IP_CAMERA_URL', 'http://192.168.0.2:8080/video')}")
 
+    # Initialize camera (choose 'pi', 'ip', or 'usb')
+    # For IP camera, ensure the URL is correct.
+    # For USB camera, camera_index might be 0, 1, etc.
+    # For Pi camera, ensure picamera library and camera are set up.
     IP_CAMERA_URL = os.getenv('IP_CAMERA_URL', "http://192.168.0.2:8080/video") # Replace with your IP camera's stream URL or use env var
-
+    # camera_handler = CameraHandler(camera_type='usb', camera_index=0)
+    # camera_handler = CameraHandler(camera_type='ip', ip_camera_url=IP_CAMERA_URL)
     camera_handler = CameraHandler(camera_type='pi')
 
 
@@ -260,14 +295,13 @@ if __name__ == "__main__":
     thread.start()
 
     print("Frame capture thread started. Waiting for first frame...")
-    time.sleep(5) # Give camera and thread some time to initialize
+    time.sleep(2) # Give camera and thread some time to initialize
 
     frame_display_time = time.time()
     detection_count = 0
 
     try:
         while True:
-            animal_count = 0
             current_frame_for_processing = None
             with lock:
                 if latest_frame is not None:
@@ -294,64 +328,84 @@ if __name__ == "__main__":
                 outputs = session.run(output_names, {input_name: input_tensor})
                 # print(f"[Main Loop] Model outputs count: {len(outputs)}")
                 # print(f"[Main Loop] Model output 0 shape: {outputs[0].shape}")
+
+
                 # Postprocess
                 detections = postprocess(outputs, original_shape, new_unpad_shape, padding_info)
 
-                # In the main detection loop, modify the person detection section:
+                # Add these imports at the top
+                from face_recognition_handler import FaceRecognitionHandler
+                from alert_owner import send_email_with_attachment_from_frame
+
+                # Add after other global variables
+                face_recognition_handler = None
+                try:
+                    face_recognition_handler = FaceRecognitionHandler()
+                    print("Face recognition system initialized successfully")
+                except Exception as e:
+                    print(f"Warning: Could not initialize face recognition: {e}")
+
+                # In the main loop, modify the detection handling section:
+                human_count = 0
+                intruder_detected = False
+                processed_frame_for_display = current_frame_for_processing.copy()
+
                 for box, class_id, score in detections:
                     label = COCO_CLASSES[class_id]
                     x, y, w, h = box
                     
                     if label == "person":
-                        print("\n=== Processing Person Detection ===")
-                        print(f"Person detected at coordinates: x={x}, y={y}, w={w}, h={h}")
-                        
-                        # Extract the person region
-                        person_frame = current_frame_for_processing[y:y+h, x:x+w]
-                        print(f"Extracted person frame shape: {person_frame.shape}")
-                        
-                        # Check if this is the owner
+                        human_count += 1
+                        # Check if this person is the owner
+                        person_frame = processed_frame_for_display[y:y+h, x:x+w]
                         if face_recognition_handler is not None:
-                            print("\nStarting face recognition...")
-                            result = face_recognition_handler.identify_person(person_frame)
-                            print(f"Face recognition result: {result}")
-                            
-                            if result is True:
-                                print("Drawing green box for owner")
-                                cv2.rectangle(processed_frame_for_display, (x, y), 
-                                            (x + w, y + h), (0, 255, 0), 2)
-                                cv2.putText(processed_frame_for_display, "Owner", 
-                                          (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 
-                                          0.5, (0, 255, 0), 2)
-                            elif result is False:
-                                print("Drawing red box for intruder")
-                                intruder_detected = True
-                                cv2.rectangle(processed_frame_for_display, (x, y), 
-                                            (x + w, y + h), (0, 0, 255), 2)
-                                cv2.putText(processed_frame_for_display, "Intruder", 
-                                          (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 
-                                          0.5, (0, 0, 255), 2)
+                            faces = face_recognition_handler.identify_faces(person_frame)
+                            if faces:
+                                is_owner = any(face['is_owner'] for face in faces)
+                                if not is_owner:
+                                    intruder_detected = True
+                                    cv2.rectangle(processed_frame_for_display, (x, y), (x + w, y + h), (0, 0, 255), 2)  # Red for intruder
+                                else:
+                                    cv2.rectangle(processed_frame_for_display, (x, y), (x + w, y + h), (0, 255, 0), 2)  # Green for owner
                             else:
-                                print("Drawing yellow box for unclear detection")
-                                cv2.rectangle(processed_frame_for_display, (x, y), 
-                                            (x + w, y + h), (0, 255, 255), 2)
-                                cv2.putText(processed_frame_for_display, "Unclear", 
-                                          (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 
-                                          0.5, (0, 255, 255), 2)
-                        else:
-                            print("Face recognition handler not initialized")
+                                # No faces detected clearly, mark as potential intruder
+                                intruder_detected = True
+                                cv2.rectangle(processed_frame_for_display, (x, y), (x + w, y + h), (0, 255, 255), 2)  # Yellow for unclear
                     elif label in ANIMAL_CLASSES:
                         animal_count += 1
-                        make_sound()
-                        print("Animal Detected")
-            
+                        cv2.rectangle(processed_frame_for_display, (x, y), (x + w, y + h), (255, 165, 0), 2)  # Orange for animals
+                    
+                    text = f"{label}: {score:.2f}"
+                    cv2.putText(processed_frame_for_display, text, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+
+                # Only alert if an intruder is detected
+                if intruder_detected:
+                    print("ALERT: Intruder detected!")
+                    try:
+                        send_email_with_attachment_from_frame(processed_frame_for_display)
+                        print("Intruder alert email sent successfully")
+                    except Exception as e:
+                        print(f"Failed to send intruder alert: {e}")
+
+                # Continue with animal detection alerts as before
+                if animal_count >= 1:
+                    detection_count += 1
+                    print(f"ALERT: Animals detected: {animal_count}")
+                    make_sound()
 
                 else:
                     print("No target humans or animals detected in this frame.")
-             
+
+                # Display the frame (optional, can be slow)
+                # cv2.imshow("Detections", processed_frame_for_display)
+                # if cv2.waitKey(1) & 0xFF == ord('q'):
+                #    break
+                
+                # Limit processing rate slightly if needed, or rely on camera frame rate
                 time.sleep(0.01) # Small sleep to yield CPU
 
             else:
+                # This case should be rare if capture_frames is working and thread is given time to start
                 print("[Main Loop] No frame available for processing. Retrying...")
                 time.sleep(0.1) # Wait if no frame was available from the thread
 

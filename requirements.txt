@@ -1,3 +1,5 @@
 opencv-python
-tensorflow==2.15.0
 ultralytics
+picamera2
+onnx
+face_recognition
