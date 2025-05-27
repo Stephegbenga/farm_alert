@@ -6,17 +6,20 @@ from ultralytics import YOLO
 # from picamera2 import Picamera2 # Replaced by CameraHandler
 from camera_handler import CameraHandler # Import the new handler
 from sound import make_sound
-from alert_owner import send_alert_to_owner # Import the alert function
+# from alert_owner import send_alert_to_owner # Import the alert function
 import os # For creating output directory
 import time # For human detection timer
+from face_recognition_handler import FaceRecognitionHandler
 
 
 # Load YOLO model
 try:
     model = YOLO('yolov8n.pt')
     print("YOLOv8n model loaded successfully.")
+    face_recognition_handler = FaceRecognitionHandler()
+    print("Face recognition system initialized successfully.")
 except Exception as e:
-    print(f"Error loading YOLO model: {e}")
+    print(f"Error initializing systems: {e}")
     sys.exit(1)
 
 
@@ -68,7 +71,7 @@ if __name__ == "__main__":
     print("---------------------------------------------------")
 
     # --- Configuration ---
-    CAMERA_TYPE = 'ip'  # 'pi' or 'ip'. For 'pi', ensure Picamera2 is installed and hardware connected.
+    CAMERA_TYPE = 'pi'  # 'pi' or 'ip'. For 'pi', ensure Picamera2 is installed and hardware connected.
     IP_CAMERA_URL = "http://192.168.0.3:8080/video" # Replace with your IP camera's stream URL
     PI_CAMERA_CONFIG = {'size': (1280, 1280), 'format': 'RGB888'} # Example config for Pi camera
     OUTPUT_DIR = "detection_outputs"
@@ -128,18 +131,27 @@ if __name__ == "__main__":
                 print("Animal detected, sound played.")
 
             if detected_humans > 0:
-                if human_detected_start_time is None:
-                    human_detected_start_time = time.time()
-                    human_alert_triggered_for_current_detection = False # Reset trigger for new detection period
-                    print(f"Human detected. Starting timer ({human_alert_threshold}s threshold).")
-                elif not human_alert_triggered_for_current_detection and (time.time() - human_detected_start_time > human_alert_threshold):
-                    print(f"Human detected for over {human_alert_threshold} seconds. Triggering alert.")
-                    send_alert_to_owner(original_frame_for_alert) # Send original frame
-                    human_alert_triggered_for_current_detection = True # Ensure alert is sent only once per continuous detection
+                # Perform face recognition when humans are detected
+                is_owner = face_recognition_handler.identify_person(frame)
+                if is_owner is True:
+                    print("Owner detected - no alert needed")
+                elif is_owner is False:
+                    print("⚠️ INTRUDER DETECTED! ⚠️")
+                    if human_detected_start_time is None:
+                        human_detected_start_time = time.time()
+                        human_alert_triggered_for_current_detection = False
+                        print(f"Intruder detected. Starting timer ({human_alert_threshold}s threshold).")
+                    elif not human_alert_triggered_for_current_detection and (time.time() - human_detected_start_time > human_alert_threshold):
+                        print(f"Intruder present for over {human_alert_threshold} seconds. Triggering alert.")
+                        # send_alert_to_owner(original_frame_for_alert)
+                        human_alert_triggered_for_current_detection = True
+                # No face detected in frame or recognition failed
+                else:
+                    print("Human detected but face not visible/recognizable")
             else: # No humans detected
                 if human_detected_start_time is not None:
                     print("Human no longer detected. Resetting timer.")
-                human_detected_start_time = None # Reset timer if no human is detected
+                human_detected_start_time = None
                 human_alert_triggered_for_current_detection = False
 
             # Display results (optional, can be kept commented out)
